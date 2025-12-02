@@ -1,0 +1,12 @@
+dnsdiff
+dnsreplay
+dnscmp
+bin/dnsdiff
+bin/dnsreplay
+bin/dnscmp
+bin/test_dnsdiff
+bin/test_dnsreplay
+bin/test_dnscmp
+cmd/dnsdiff/dnsdiff
+cmd/dnsreplay/dnsreplay
+cmd/dnscmp/dnscmp

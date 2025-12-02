@@ -1,0 +1,73 @@
+# DNS Diff 白名单配置（支持正则表达式）
+# 
+# 此配置文件用于定义DNS差异对比的白名单规则，使用正则表达式匹配域名
+# 当域名匹配正则表达式时，指定类型的差异将被忽略
+#
+# 配置格式：
+# whitelist:
+#   - diff_type: 差异类型名称（必填）
+#     patterns:  正则表达式列表（必填）
+#     description: 规则描述（可选）
+#
+# 支持的差异类型：
+#   - NOMATCH              # 未匹配
+#   - NOMATCHKEY           # 未匹配键
+#   - NOMATCHDOMAIN        # 未匹配域名
+#   - RCODE_DIFF           # 响应码差异
+#   - OPCODE_DIFF          # 操作码差异
+#   - QFLAG_DIFF           # 查询标志差异
+#   - QUEST_LEN_DIFF       # Question段长度差异
+#   - QNAME_DIFF           # 查询名称差异
+#   - QTYPE_DIFF           # 查询类型差异
+#   - QCLASS_DIFF          # 查询类差异
+#   - ANSWER_01_DIFF       # Answer段0/1差异
+#   - ANSWER_LEN_DIFF      # Answer段长度差异
+#   - ANSWER_CNAME_DIFF    # Answer段CNAME差异
+#   - ANSWER_RR_DIFF       # Answer段RR记录差异
+#   - AUTH_LEN_DIFF        # Authority段长度差异
+#   - AUTH_RR_DIFF         # Authority段RR记录差异
+#   - AUTH_CNAME_DIFF      # Authority段CNAME差异
+#   - ADD_LEN_DIFF         # Additional段长度差异
+#   - ADD_RR_DIFF          # Additional段RR记录差异
+#   - ADD_CNAME_DIFF       # Additional段CNAME差异
+#
+# 正则表达式说明：
+#   - 使用Go标准库regexp包的语法
+#   - 匹配是大小写敏感的，建议在正则中使用(?i)实现大小写不敏感
+#   - 正则表达式会自动验证，无效的正则会被跳过并给出警告
+#
+# 常用正则模式：
+#   - .*\.db\.$    # 匹配所有.db.结尾的域名
+#   - ^test\.example\.com$          # 精确匹配test.example.com
+#   - (?i).*\.cdn\..*               # 大小写不敏感匹配所有.cdn.开头的域名
+#   - .*\.(staging|test)\..*        # 匹配所有.staging.或.test.的域名
+
+whitelist:
+  # 忽略.db.域名的Answer RR差异；忽略cdn.域名的Answer RR差异
+  - diff_type: ANSWER_RR_DIFF
+    patterns:
+      - '(?i)\.db\.$'
+      - '(?i)cdn\.' 
+    description: "Ignore ANSWER_RR_DIFF for db domains"
+
+
+# 使用说明：
+# 1. 复制此文件到项目根目录，命名为 whitelist.yaml
+# 2. 根据实际需求修改正则表达式模式
+# 3. 运行 dnsdiff 或 dnscmp 时使用 -w 参数指定配置文件：
+#    ./dnsdiff -f traffic.pcap -w whitelist.yaml
+#    ./dnscmp -t test.pcap -o origin.pcap -w whitelist.yaml
+# 4. 如果不指定 -w 参数，程序会尝试加载默认的 whitelist.yaml 文件（如果存在）
+#
+# 正则表达式测试：
+# 可以使用以下Go代码测试正则表达式：
+# package main
+# import (
+#     "fmt"
+#     "regexp"
+# )
+# func main() {
+#     re, _ := regexp.Compile(".*\\.mig\\.db\\.example\\.com$")
+#     fmt.Println(re.MatchString("test.mig.db.example.com"))  // true
+#     fmt.Println(re.MatchString("mig.db.example.com"))      // false
+# }
