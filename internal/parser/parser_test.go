@@ -317,37 +317,94 @@ func TestParseFile_SaveRspFalse(t *testing.T) {
 	}
 }
 
-func TestParse2Chan(t *testing.T) {
-	// Create a simple pcap file
+func TestParseRaw2Chan(t *testing.T) {
+	// Create a pcap file with DNS packets
 	tempDir := t.TempDir()
-	testFile := filepath.Join(tempDir, "test.pcap")
+	testFile := filepath.Join(tempDir, "raw_dns.pcap")
 
 	f, err := os.Create(testFile)
 	if err != nil {
 		t.Fatalf("Failed to create test file: %v", err)
 	}
+	defer f.Close()
 
 	w := pcapgo.NewWriter(f)
-	w.WriteFileHeader(65536, layers.LinkTypeEthernet)
+	if err := w.WriteFileHeader(65536, layers.LinkTypeEthernet); err != nil {
+		t.Fatalf("Failed to write pcap header: %v", err)
+	}
+
+	// 1. Create DNS query packet (QR=0)
+	queryMsg := new(dns.Msg)
+	queryMsg.SetQuestion("example.com.", dns.TypeA)
+	queryData, _ := queryMsg.Pack()
+
+	eth := &layers.Ethernet{
+		SrcMAC:       []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x01},
+		DstMAC:       []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x02},
+		EthernetType: layers.EthernetTypeIPv4,
+	}
+	ip := &layers.IPv4{
+		Version:  4,
+		TTL:      64,
+		Protocol: layers.IPProtocolUDP,
+		SrcIP:    []byte{10, 0, 0, 1},
+		DstIP:    []byte{8, 8, 8, 8},
+	}
+	udp := &layers.UDP{
+		SrcPort: 12345,
+		DstPort: 53,
+	}
+	udp.SetNetworkLayerForChecksum(ip)
+
+	buf := gopacket.NewSerializeBuffer()
+	opts := gopacket.SerializeOptions{ComputeChecksums: true, FixLengths: true}
+	gopacket.SerializeLayers(buf, opts, eth, ip, udp, gopacket.Payload(queryData))
+	w.WritePacket(gopacket.CaptureInfo{Timestamp: time.Now(), CaptureLength: len(buf.Bytes()), Length: len(buf.Bytes())}, buf.Bytes())
+
+	// 2. Create DNS response packet (QR=1)
+	respMsg := new(dns.Msg)
+	respMsg.SetReply(queryMsg)
+	respData, _ := respMsg.Pack()
+
+	ip2 := &layers.IPv4{
+		Version:  4,
+		TTL:      64,
+		Protocol: layers.IPProtocolUDP,
+		SrcIP:    []byte{8, 8, 8, 8},
+		DstIP:    []byte{10, 0, 0, 1},
+	}
+	udp2 := &layers.UDP{
+		SrcPort: 53,
+		DstPort: 12345,
+	}
+	udp2.SetNetworkLayerForChecksum(ip2)
+
+	buf2 := gopacket.NewSerializeBuffer()
+	gopacket.SerializeLayers(buf2, opts, eth, ip2, udp2, gopacket.Payload(respData))
+	w.WritePacket(gopacket.CaptureInfo{Timestamp: time.Now(), CaptureLength: len(buf2.Bytes()), Length: len(buf2.Bytes())}, buf2.Bytes())
+
+	// 3. Create short packet (< 6 bytes payload) -> Should be treated as Req
+	shortData := []byte{0x00, 0x01, 0x00} // 3 bytes
+	buf3 := gopacket.NewSerializeBuffer()
+	gopacket.SerializeLayers(buf3, opts, eth, ip, udp, gopacket.Payload(shortData))
+	w.WritePacket(gopacket.CaptureInfo{Timestamp: time.Now(), CaptureLength: len(buf3.Bytes()), Length: len(buf3.Bytes())}, buf3.Bytes())
+
 	f.Close()
 
-	// Create channels
+	// Test ParseRaw2Chan
 	reqChan := make(chan *types.DNSReq, 10)
 	rspChan := make(chan *types.DNSRsp, 10)
 
-	// Parse to channels
 	go func() {
-		err := Parse2Chan(testFile, reqChan, rspChan)
+		err := ParseRaw2Chan(testFile, reqChan, rspChan)
 		if err != nil {
-			t.Errorf("Parse2Chan returned error: %v", err)
+			t.Errorf("ParseRaw2Chan returned error: %v", err)
 		}
 	}()
 
-	// Collect results
 	reqCount := 0
 	rspCount := 0
 
-	// Read from channels until they're closed
 	for {
 		select {
 		case req, ok := <-reqChan:
@@ -361,24 +418,30 @@ func TestParse2Chan(t *testing.T) {
 				rspChan = nil
 			} else if rsp != nil {
 				rspCount++
+				if len(rsp.RawData) == 0 {
+					t.Error("Expected non-empty RawData in response")
+				}
+				if rsp.Req != nil {
+					t.Error("Expected nil Req in response")
+				}
 			}
 		}
-
 		if reqChan == nil && rspChan == nil {
 			break
 		}
 	}
 
-	// For empty pcap, counts should be 0
-	if reqCount != 0 {
-		t.Logf("Request count: %d", reqCount)
+	// Expected: 1 normal query + 1 short packet (treated as query) = 2 Reqs
+	//           1 normal response = 1 Rsp
+	if reqCount != 2 {
+		t.Errorf("Expected 2 requests, got %d", reqCount)
 	}
-	if rspCount != 0 {
-		t.Logf("Response count: %d", rspCount)
+	if rspCount != 1 {
+		t.Errorf("Expected 1 response, got %d", rspCount)
 	}
 }
 
-func TestParse2Chan_NilChannels(t *testing.T) {
+func TestParseRaw2Chan_NilChannels(t *testing.T) {
 	// Create a simple pcap file
 	tempDir := t.TempDir()
 	testFile := filepath.Join(tempDir, "test.pcap")
@@ -393,17 +456,17 @@ func TestParse2Chan_NilChannels(t *testing.T) {
 	f.Close()
 
 	// Test with nil channels (should not panic)
-	err = Parse2Chan(testFile, nil, nil)
+	err = ParseRaw2Chan(testFile, nil, nil)
 	if err != nil {
-		t.Errorf("Parse2Chan with nil channels returned error: %v", err)
+		t.Errorf("ParseRaw2Chan with nil channels returned error: %v", err)
 	}
 }
 
-func TestParse2Chan_InvalidFile(t *testing.T) {
+func TestParseRaw2Chan_InvalidFile(t *testing.T) {
 	reqChan := make(chan *types.DNSReq, 10)
 	rspChan := make(chan *types.DNSRsp, 10)
 
-	err := Parse2Chan("/nonexistent/file.pcap", reqChan, rspChan)
+	err := ParseRaw2Chan("/nonexistent/file.pcap", reqChan, rspChan)
 	if err == nil {
 		t.Error("Expected error for non-existent file")
 	}
@@ -460,7 +523,7 @@ func TestParseOne(t *testing.T) {
 	reqCnt := 0
 	rspCnt := 0
 
-	req, rsp, err := parseOne(&packet, &reqCnt, &rspCnt)
+	req, rsp, err := parseOne(packet, &reqCnt, &rspCnt)
 
 	if err != nil {
 		t.Errorf("parseOne returned error: %v", err)

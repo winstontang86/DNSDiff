@@ -271,8 +271,9 @@ func TestBuildDNSContent(t *testing.T) {
 			msg:  nil,
 			num:  1,
 			checkFunc: func(s string) bool {
-				return strings.Contains(s, "# star 1") &&
-					strings.Contains(s, "The number 1")
+				return strings.Contains(s, "#===== [0001] START") &&
+					strings.Contains(s, "(empty content)") &&
+					strings.Contains(s, "#===== [0001] END")
 			},
 		},
 		{
@@ -296,10 +297,11 @@ func TestBuildDNSContent(t *testing.T) {
 			}(),
 			num: 2,
 			checkFunc: func(s string) bool {
-				return strings.Contains(s, "# star 2") &&
+				return strings.Contains(s, "#===== [0002] START") &&
 					strings.Contains(s, "QUESTION SECTION") &&
 					strings.Contains(s, "ANSWER SECTION") &&
-					strings.Contains(s, "example.com.")
+					strings.Contains(s, "example.com.") &&
+					strings.Contains(s, "#===== [0002] END")
 			},
 		},
 		{
@@ -352,9 +354,9 @@ func TestBuildDNSContent(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := buildDNSContent(tt.msg, tt.num)
+			result := BuildDNSContent(tt.msg, tt.num)
 			if !tt.checkFunc(result) {
-				t.Errorf("buildDNSContent output doesn't match expected pattern:\n%s", result)
+				t.Errorf("BuildDNSContent output doesn't match expected pattern:\n%s", result)
 			}
 		})
 	}
@@ -396,7 +398,7 @@ func TestProcLayerData(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// Note: procLayerData is not exported, so we test it indirectly
 			// through buildDNSContent which it uses
-			content := buildDNSContent(tt.msg, tt.num)
+			content := BuildDNSContent(tt.msg, tt.num)
 			if content == "" {
 				t.Error("Expected non-empty content")
 			}
@@ -553,7 +555,7 @@ func BenchmarkBuildDNSContent(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = buildDNSContent(msg, i)
+		_ = BuildDNSContent(msg, i)
 	}
 }
 
@@ -588,5 +590,313 @@ func BenchmarkFormatDomainName(b *testing.B) {
 		for _, domain := range domains {
 			_ = formatDomainName(domain)
 		}
+	}
+}
+
+// ==================== sortRRs 测试 ====================
+
+func TestSortRRs(t *testing.T) {
+	tests := []struct {
+		name  string
+		rrs   []dns.RR
+		check func([]dns.RR) bool
+	}{
+		{
+			name:  "empty slice",
+			rrs:   []dns.RR{},
+			check: func(rrs []dns.RR) bool { return len(rrs) == 0 },
+		},
+		{
+			name: "single element",
+			rrs: []dns.RR{
+				&dns.A{
+					Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+					A:   net.ParseIP("1.2.3.4"),
+				},
+			},
+			check: func(rrs []dns.RR) bool { return len(rrs) == 1 },
+		},
+		{
+			name: "sort by type",
+			rrs: []dns.RR{
+				&dns.AAAA{
+					Hdr:  dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 300},
+					AAAA: net.ParseIP("::1"),
+				},
+				&dns.A{
+					Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+					A:   net.ParseIP("1.2.3.4"),
+				},
+			},
+			check: func(rrs []dns.RR) bool {
+				return rrs[0].Header().Rrtype == dns.TypeA && rrs[1].Header().Rrtype == dns.TypeAAAA
+			},
+		},
+		{
+			name: "sort by name within same type",
+			rrs: []dns.RR{
+				&dns.A{
+					Hdr: dns.RR_Header{Name: "z.example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+					A:   net.ParseIP("1.2.3.4"),
+				},
+				&dns.A{
+					Hdr: dns.RR_Header{Name: "a.example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+					A:   net.ParseIP("5.6.7.8"),
+				},
+			},
+			check: func(rrs []dns.RR) bool {
+				return rrs[0].Header().Name == "a.example.com." && rrs[1].Header().Name == "z.example.com."
+			},
+		},
+		{
+			name: "sort by data within same type and name",
+			rrs: []dns.RR{
+				&dns.A{
+					Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+					A:   net.ParseIP("9.9.9.9"),
+				},
+				&dns.A{
+					Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+					A:   net.ParseIP("1.1.1.1"),
+				},
+			},
+			check: func(rrs []dns.RR) bool {
+				return strings.Contains(rrs[0].String(), "1.1.1.1")
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := sortRRs(tt.rrs)
+			if !tt.check(result) {
+				t.Errorf("排序结果不符合预期")
+				for i, rr := range result {
+					t.Logf("  [%d] %s", i, rr.String())
+				}
+			}
+		})
+	}
+}
+
+func TestSortRRs_DoesNotModifyOriginal(t *testing.T) {
+	original := []dns.RR{
+		&dns.AAAA{
+			Hdr:  dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 300},
+			AAAA: net.ParseIP("::1"),
+		},
+		&dns.A{
+			Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+			A:   net.ParseIP("1.2.3.4"),
+		},
+	}
+
+	originalFirstType := original[0].Header().Rrtype
+	_ = sortRRs(original)
+
+	// 原始切片不应被修改
+	if original[0].Header().Rrtype != originalFirstType {
+		t.Error("sortRRs 不应修改原始切片")
+	}
+}
+
+// ==================== filterNonOPT 测试 ====================
+
+func TestFilterNonOPT(t *testing.T) {
+	rrs := []dns.RR{
+		&dns.A{
+			Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+			A:   net.ParseIP("1.2.3.4"),
+		},
+		&dns.OPT{
+			Hdr: dns.RR_Header{Name: ".", Rrtype: dns.TypeOPT},
+		},
+		&dns.NS{
+			Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeNS, Class: dns.ClassINET, Ttl: 300},
+			Ns:  "ns1.example.com.",
+		},
+	}
+
+	result := filterNonOPT(rrs)
+	if len(result) != 2 {
+		t.Errorf("期望 2 条非 OPT 记录，得到 %d", len(result))
+	}
+	for _, rr := range result {
+		if _, ok := rr.(*dns.OPT); ok {
+			t.Error("结果中不应包含 OPT 记录")
+		}
+	}
+}
+
+// ==================== formatRR default 分支和更多类型测试 ====================
+
+func TestFormatRR_SRVRecord(t *testing.T) {
+	rr := &dns.SRV{
+		Hdr: dns.RR_Header{
+			Name:   "_http._tcp.example.com.",
+			Rrtype: dns.TypeSRV,
+			Class:  dns.ClassINET,
+			Ttl:    300,
+		},
+		Priority: 10,
+		Weight:   20,
+		Port:     80,
+		Target:   "server.example.com.",
+	}
+	result := formatRR(rr)
+	if !strings.Contains(result, "SRV") {
+		t.Errorf("期望包含 SRV，得到: %s", result)
+	}
+	if !strings.Contains(result, "server.example.com.") {
+		t.Errorf("期望包含 target，得到: %s", result)
+	}
+}
+
+func TestFormatRR_DSRecord(t *testing.T) {
+	rr := &dns.DS{
+		Hdr: dns.RR_Header{
+			Name:   "example.com.",
+			Rrtype: dns.TypeDS,
+			Class:  dns.ClassINET,
+			Ttl:    300,
+		},
+		KeyTag:     12345,
+		Algorithm:  8,
+		DigestType: 2,
+		Digest:     "AABBCCDD",
+	}
+	result := formatRR(rr)
+	if !strings.Contains(result, "DS") {
+		t.Errorf("期望包含 DS，得到: %s", result)
+	}
+	if !strings.Contains(result, "12345") {
+		t.Errorf("期望包含 KeyTag，得到: %s", result)
+	}
+}
+
+func TestFormatRR_DefaultBranch(t *testing.T) {
+	// 使用 NAPTR 记录触发 default 分支
+	rr := &dns.NAPTR{
+		Hdr: dns.RR_Header{
+			Name:     "example.com.",
+			Rrtype:   dns.TypeNAPTR,
+			Class:    dns.ClassINET,
+			Ttl:      300,
+			Rdlength: 50,
+		},
+		Order:       100,
+		Preference:  10,
+		Flags:       "u",
+		Service:     "SIP+D2U",
+		Regexp:      "!^.*$!sip:info@example.com!",
+		Replacement: ".",
+	}
+	result := formatRR(rr)
+	if !strings.Contains(result, "NAPTR") {
+		t.Errorf("期望包含 NAPTR，得到: %s", result)
+	}
+}
+
+func TestFormatRR_NilIP(t *testing.T) {
+	// A 记录但 A 为 nil
+	rr := &dns.A{
+		Hdr: dns.RR_Header{
+			Name:   "example.com.",
+			Rrtype: dns.TypeA,
+			Class:  dns.ClassINET,
+			Ttl:    300,
+		},
+		A: nil,
+	}
+	result := formatRR(rr)
+	if result == "" {
+		t.Error("期望非空输出即使 A 为 nil")
+	}
+
+	// AAAA 记录但 AAAA 为 nil
+	rr2 := &dns.AAAA{
+		Hdr: dns.RR_Header{
+			Name:   "example.com.",
+			Rrtype: dns.TypeAAAA,
+			Class:  dns.ClassINET,
+			Ttl:    300,
+		},
+		AAAA: nil,
+	}
+	result2 := formatRR(rr2)
+	if result2 == "" {
+		t.Error("期望非空输出即使 AAAA 为 nil")
+	}
+}
+
+// ==================== BuildDNSContent 更多场景测试 ====================
+
+func TestBuildDNSContent_WithEDNS(t *testing.T) {
+	msg := new(dns.Msg)
+	msg.SetQuestion("example.com.", dns.TypeA)
+	msg.Response = true
+	msg.RecursionDesired = true
+	msg.RecursionAvailable = true
+	msg.Answer = append(msg.Answer, &dns.A{
+		Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+		A:   net.ParseIP("1.2.3.4"),
+	})
+
+	opt := new(dns.OPT)
+	opt.Hdr.Name = "."
+	opt.Hdr.Rrtype = dns.TypeOPT
+	opt.SetUDPSize(4096)
+	opt.SetDo()
+	msg.Extra = append(msg.Extra, opt)
+
+	result := BuildDNSContent(msg, 1)
+	if !strings.Contains(result, "OPT PSEUDOSECTION") {
+		t.Error("期望包含 OPT PSEUDOSECTION")
+	}
+	if !strings.Contains(result, "EDNS") {
+		t.Error("期望包含 EDNS 信息")
+	}
+}
+
+func TestBuildDNSContent_AllFlags(t *testing.T) {
+	msg := new(dns.Msg)
+	msg.SetQuestion("example.com.", dns.TypeA)
+	msg.Response = true
+	msg.Authoritative = true
+	msg.Truncated = true
+	msg.RecursionDesired = true
+	msg.RecursionAvailable = true
+	msg.Zero = true
+	msg.AuthenticatedData = true
+	msg.CheckingDisabled = true
+
+	result := BuildDNSContent(msg, 1)
+	for _, flag := range []string{"qr", "aa", "tc", "rd", "ra", "z", "ad", "cd"} {
+		if !strings.Contains(result, flag) {
+			t.Errorf("期望包含 flag %q", flag)
+		}
+	}
+}
+
+func TestSaveDiff_BothNilMessages(t *testing.T) {
+	tempDir := t.TempDir()
+	originalWd, _ := os.Getwd()
+	defer os.Chdir(originalWd)
+
+	if err := os.Chdir(tempDir); err != nil {
+		t.Fatalf("Failed to change directory: %v", err)
+	}
+
+	saveChan := make(chan types.SaveChan, 10)
+
+	go func() {
+		// 发送 Old 和 New 都为 nil 的情况
+		saveChan <- types.SaveChan{Old: nil, New: nil}
+		close(saveChan)
+	}()
+
+	err := SaveDiff(saveChan)
+	if err != nil {
+		t.Errorf("SaveDiff returned error: %v", err)
 	}
 }

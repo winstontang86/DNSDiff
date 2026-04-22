@@ -12,10 +12,6 @@ func TestDefaultCompareConfig(t *testing.T) {
 		t.Fatal("DefaultCompareConfig returned nil")
 	}
 
-	if !config.IgnoreTTL {
-		t.Error("Expected IgnoreTTL to be true")
-	}
-
 	if !config.AllowPartialMatch {
 		t.Error("Expected AllowPartialMatch to be true")
 	}
@@ -132,7 +128,6 @@ func TestCompareConfig_ToComparator(t *testing.T) {
 		{
 			name: "default config",
 			config: &CompareConfig{
-				IgnoreTTL:          true,
 				AllowPartialMatch:  true,
 				IgnoreAdditional:   true,
 				DiffUnexpectedMask: diff.DefaultMask,
@@ -141,7 +136,6 @@ func TestCompareConfig_ToComparator(t *testing.T) {
 		{
 			name: "all false config",
 			config: &CompareConfig{
-				IgnoreTTL:          false,
 				AllowPartialMatch:  false,
 				IgnoreAdditional:   false,
 				DiffUnexpectedMask: 0x00000000,
@@ -150,7 +144,6 @@ func TestCompareConfig_ToComparator(t *testing.T) {
 		{
 			name: "custom mask config",
 			config: &CompareConfig{
-				IgnoreTTL:          true,
 				AllowPartialMatch:  false,
 				IgnoreAdditional:   true,
 				DiffUnexpectedMask: 0xFFFFFFFF,
@@ -159,7 +152,6 @@ func TestCompareConfig_ToComparator(t *testing.T) {
 		{
 			name: "mixed config",
 			config: &CompareConfig{
-				IgnoreTTL:          false,
 				AllowPartialMatch:  true,
 				IgnoreAdditional:   false,
 				DiffUnexpectedMask: 0x12345678,
@@ -170,14 +162,6 @@ func TestCompareConfig_ToComparator(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			comparator := tt.config.ToComparator()
-
-			if comparator.IgnoreTTL != tt.config.IgnoreTTL {
-				t.Errorf("IgnoreTTL = %v, want %v", comparator.IgnoreTTL, tt.config.IgnoreTTL)
-			}
-
-			if comparator.AllowPartialMatch != tt.config.AllowPartialMatch {
-				t.Errorf("AllowPartialMatch = %v, want %v", comparator.AllowPartialMatch, tt.config.AllowPartialMatch)
-			}
 
 			if comparator.IgnoreAdditional != tt.config.IgnoreAdditional {
 				t.Errorf("IgnoreAdditional = %v, want %v", comparator.IgnoreAdditional, tt.config.IgnoreAdditional)
@@ -201,9 +185,6 @@ func TestCompareConfig_Integration(t *testing.T) {
 		config := DefaultCompareConfig()
 		comparator := config.ToComparator()
 
-		if !comparator.IgnoreTTL {
-			t.Error("Expected IgnoreTTL to be true")
-		}
 		if !comparator.AllowPartialMatch {
 			t.Error("Expected AllowPartialMatch to be true")
 		}
@@ -224,7 +205,6 @@ func TestCompareConfig_Integration(t *testing.T) {
 		}
 
 		config := &CompareConfig{
-			IgnoreTTL:          false,
 			AllowPartialMatch:  false,
 			IgnoreAdditional:   false,
 			DiffUnexpectedMask: mask,

@@ -4,7 +4,6 @@ package types
 import (
 	"time"
 
-	"github.com/google/gopacket/layers"
 	"github.com/miekg/dns"
 )
 
@@ -34,7 +33,7 @@ type DNSRsp struct {
 	ClientPort string
 	IsTCP      bool
 	Time       time.Time
-	DnsData    *layers.DNS
+	RawData    []byte  // DNS报文原始二进制数据
 	Req        *DNSReq // 关联的请求
 }
 

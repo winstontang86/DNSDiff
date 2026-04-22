@@ -56,7 +56,7 @@ func Domain2Zone(domain string) string {
 // Find4diff 查找一个dns响应报文对应的用于对比的响应报文
 func Find4diff(newRsp *types.DNSRsp, rspmap types.RspMap) (*types.DNSRsp, error) {
 	var originRsp *types.DNSRsp
-	if newRsp == nil || newRsp.DnsData == nil {
+	if newRsp == nil {
 		return originRsp, nil
 	}
 	newMsg, err := types.DNSRspToMsg(newRsp)

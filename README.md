@@ -45,10 +45,11 @@ diffcode 如下：
   
 
 ## 工具使用：
-本仓库提供三个工具：   
+本仓库提供四个工具：   
 dnsdiff  进行dns请求重放+比较的工具（支持智能重试）   
 dnsreplay  进行dns请求重放的工具，可以指定重放速率   
 dnscmp  对rsp的pcap进行分析对比的工具（支持智能重试）   
+formcheck  对pcap文件中的DNS报文进行格式校验的工具
 
 使用的话，直接把代码clone到一个有golang的环境，直接执行build.sh就可以获得编译结果工具文件
 
@@ -67,6 +68,24 @@ dnscmp  对rsp的pcap进行分析对比的工具（支持智能重试）
 2. **重试对比**：如果首次有差异，对origin和test各发起两次请求
 3. **Answer段合并**：当三次都是DIFF_BIT_ANSWER_RRDIFF时，合并Answer段最终对比
 
+### formcheck
+功能描述：对pcap文件中的DNS报文进行深度格式校验，支持请求/响应格式检查及关联性检查。
+校验结果会生成统计文件 `check_summary_日期时间.csv`。
+
+```
+Usage of ./formcheck: 
+  -f string
+        Path to pcap file (required)
+  -d string
+        Target IP to filter (optional)
+  -c string
+        Check mode: req | rsp | all (default "all")
+  -warn
+        Print packets with warnings (errors are always printed)
+  -qps int
+        Rate limit (requests per second) when active probing is enabled (d is set). 0 means no limit
+```
+
 ### dnsdiff
 功能描述：这个dnsdiff工具可以从pcap包进行重放并对比，重放的时候可以指定重放速度。具有智能重试机制：
 - 首次对比：根据qonly参数决定originMsg获取方式（map或网络请求）
@@ -79,6 +98,7 @@ diffnew-xxxxx.txt 对比有差异的响应中被测机器的响应
 diffstat-xxxx.txt 统计汇总信息  
 diffstat-xxxx.csv 统计差异详情文件，使用表格方式，方便上传为在线文档处理
 
+```
 $ ./dnsdiff -h  
 Usage of ./dnsdiff:  
   -ap int  
@@ -105,11 +125,12 @@ Usage of ./dnsdiff:
         Test server IP address (required)  
   -w string  
         Path to whitelist config file in YAML format (optional)
-
+```
 
 ### dnscmp
 功能描述：这个工具对现网流量对比的两个pcap文件进行分析对比。对比会生成4个文件，同上面的dnsdiff    
 
+```
 Usage of ./dnscmp:  
   -a int  
         Ignore Addition (default 1)  
@@ -123,11 +144,12 @@ Usage of ./dnscmp:
         Allow partial match (default 1)  
   -t string  
         Test server pcap file (required)
-
+```
 
 ### dnsrepaly
 功能描述：利用抓包pcap文件，指定速度重放。  
 
+```
 Usage of ./dnsreplay:  
   -c int  
         Number of consumers (default 1000)  
@@ -137,7 +159,7 @@ Usage of ./dnsreplay:
         Path to the pcap file (required)  
 -r int  
         Rate limit (requests per second) (default 1)
-
+```
 ---
 
 ## 项目目录结构说明
@@ -155,7 +177,9 @@ dnsdiff/
 │   │   └── main.go
 │   ├── dnscmp/            # DNS对比工具（仅对比pcap文件）
 │   │   └── main.go
-│   └── dnsreplay/         # DNS重放工具
+│   ├── dnsreplay/         # DNS重放工具
+│       └── main.go
+│   └── formcheck/         # DNS格式校验工具
 │       └── main.go
 ├── internal/              # 内部库（不对外暴露）
 │   ├── app/              # 应用层逻辑
@@ -169,8 +193,10 @@ dnsdiff/
 │   │   └── parser.go
 │   ├── saver/            # 差异结果保存
 │   │   └── saver.go
-│   └── statistics/       # 统计信息收集
+│   ├── statistics/       # 统计信息收集
 │       └── statistics.go
+│   └── validate/         # DNS报文格式校验
+│       └── validate.go
 ├── pkg/                  # 可对外暴露的库
 │   ├── types/           # 公共数据类型
 │   │   ├── types.go     # 数据结构定义
@@ -193,11 +219,12 @@ dnsdiff/
 
 #### cmd/ - 可执行程序入口
 
-包含三个独立的命令行工具：
+包含四个独立的命令行工具：
 
 - **dnsdiff**: 完整的DNS对比工具，支持从pcap文件解析、网络重试、结果保存
 - **dnscmp**: 轻量级DNS对比工具，仅对比两个pcap文件的内容
 - **dnsreplay**: DNS请求重放工具，用于压力测试
+- **formcheck**: DNS报文格式校验工具，用于检测报文是否符合RFC规范
 
 #### internal/ - 内部库
 
@@ -231,6 +258,12 @@ dnsdiff/
 - 对比结果统计
 - 性能指标收集
 - 报告生成
+
+##### internal/validate - 格式校验
+- DNS报文结构校验
+- RFC规范合规性检查
+- 请求/响应关联校验
+- 详细的错误码定义（参见 `internal/validate/validate.md`）
 
 #### pkg/ - 公共库
 
@@ -266,6 +299,7 @@ dnsdiff/
 go build -o dnsdiff ./cmd/dnsdiff
 go build -o dnscmp ./cmd/dnscmp
 go build -o dnsreplay ./cmd/dnsreplay
+go build -o formcheck ./cmd/formcheck
 ```
 
 #### 使用示例
@@ -279,6 +313,9 @@ go build -o dnsreplay ./cmd/dnsreplay
 
 # DNS重放
 ./dnsreplay -f test.pcap -d 10.0.0.1
+
+# DNS格式校验
+./formcheck -f test.pcap
 ```
 
 ### 依赖关系

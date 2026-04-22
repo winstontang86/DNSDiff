@@ -16,7 +16,8 @@ import (
 
 // 注意！这里的包级全局变量没有带锁，设计上就是需要先进行解析再做其他操作，
 // 如果场景变量，该用 sync.Map 或 sync.RWMutex 来实现，性能稍微差一点点
-// 优化：移除固定大容量预分配，改为在函数内部动态分配，减少内存浪费
+// 优化：移除固定大容量预分配，改为在 ParseFile 函数内部动态分配，减少内存浪费
+// 注意：返回的数据是全局变量的引用，多次调用 ParseFile 会覆盖之前的数据
 var (
 	// 响应存储 map（延迟初始化）
 	rspMap types.RspMap
@@ -24,8 +25,12 @@ var (
 	reqArr []types.DNSReq
 )
 
-// Parse2Chan chan谁负责生产谁负责 close，所以这个函数会 close 掉 reqChan 和 rspChan
-func Parse2Chan(pcapFile string, reqChan chan<- *types.DNSReq, rspChan chan<- *types.DNSRsp) error {
+// ParseRaw2Chan 只做抓包拆分：根据 DNS 标志位判断 req/rsp，并把 DNS 原始二进制塞到对应结构里。
+// - 判断规则：读取 DNS 头部 QR 位，0 为请求，1 为响应
+// - 如果 DNS 内容长度小于 6 字节，直接当做是请求
+// - 不做 BytesToDNSMsg 的转换（不做 dns.Msg 校验）
+// - chan 谁负责生产谁负责 close，所以这个函数会 close 掉 reqChan 和 rspChan
+func ParseRaw2Chan(pcapFile string, reqChan chan<- *types.DNSReq, rspChan chan<- *types.DNSRsp) error {
 	rspCnt := 0
 	reqCnt := 0
 
@@ -37,7 +42,7 @@ func Parse2Chan(pcapFile string, reqChan chan<- *types.DNSReq, rspChan chan<- *t
 
 	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
 	for packet := range packetSource.Packets() {
-		req, rsp, err := parseOne(&packet, &reqCnt, &rspCnt)
+		req, rsp, err := parseOne(packet, &reqCnt, &rspCnt)
 		if err != nil {
 			logrus.Error(err)
 			continue
@@ -49,10 +54,12 @@ func Parse2Chan(pcapFile string, reqChan chan<- *types.DNSReq, rspChan chan<- *t
 			rspChan <- rsp
 		}
 	}
+
 	logrus.WithFields(logrus.Fields{
 		"reqCnt": reqCnt,
 		"rspCnt": rspCnt,
-	}).Info("parse end")
+	}).Info("parse raw end")
+
 	if reqChan != nil {
 		close(reqChan)
 	}
@@ -143,7 +150,7 @@ func ParseFile(pcapFile string, saveRsp bool) (*[]types.DNSReq, types.RspMap, er
 						ClientPort: dstPort.String(),
 						IsTCP:      isTcp,
 						Time:       packet.Metadata().Timestamp,
-						DnsData:    dnsPacket,
+						RawData:    rawDnsData,
 					}
 					domain := msg.Question[0].Name
 					key := utils.GenU64Key(msg.Question[0].Qclass, msg.Question[0].Qtype, msg.Id, msg.Opcode)
@@ -180,60 +187,87 @@ func ParseFile(pcapFile string, saveRsp bool) (*[]types.DNSReq, types.RspMap, er
 	return &reqArr, rspMap, nil
 }
 
-func parseOne(packet *gopacket.Packet, reqCnt, rspCnt *int) (*types.DNSReq, *types.DNSRsp, error) {
-	var req *types.DNSReq
-	var rsp *types.DNSRsp
-	networkLayer := (*packet).NetworkLayer()
-	transportLayer := (*packet).TransportLayer()
+func parseOne(packet gopacket.Packet, reqCnt, rspCnt *int) (*types.DNSReq, *types.DNSRsp, error) {
+	networkLayer := packet.NetworkLayer()
+	transportLayer := packet.TransportLayer()
 	// 确保网络层和传输层存在
 	if networkLayer == nil || transportLayer == nil {
 		return nil, nil, fmt.Errorf("parse: network or transport layer not found")
 	}
-	// 检查是否有 DNS 层
-	if dnsLayer := (*packet).Layer(layers.LayerTypeDNS); dnsLayer != nil {
-		dnsPacket, ok := dnsLayer.(*layers.DNS)
-		if !ok {
-			return nil, nil, fmt.Errorf("parse: failed to get DNS layer")
-		}
-		srcIP, dstIP := networkLayer.NetworkFlow().Endpoints()
-		srcPort, dstPort := transportLayer.TransportFlow().Endpoints()
-		// 获取传输层协议
-		isTcp := false
-		if transportLayer.LayerType() == layers.LayerTypeTCP {
-			isTcp = true
-		}
 
-		// 请求和响应分别处理
-		if !dnsPacket.QR { // DNS Query
-			rawDnsData := dnsLayer.LayerContents()
-			// 将 DNS 请求的原始数据保存到 DNSReq 结构中
-			req = &types.DNSReq{
-				ClientIP:   srcIP.String(),
-				ClientPort: srcPort.String(),
-				IsTCP:      isTcp,
-				Time:       (*packet).Metadata().Timestamp,
-				RawData:    rawDnsData,
-			}
-			(*reqCnt)++
-		} else { // DNS Response
-
-			if len(dnsPacket.Questions) > 0 {
-				rsp = &types.DNSRsp{
-					ClientIP:   dstIP.String(),
-					ClientPort: dstPort.String(),
-					IsTCP:      isTcp,
-					Time:       (*packet).Metadata().Timestamp,
-					DnsData:    dnsPacket,
-				}
-				(*rspCnt)++
-			} else {
-				return nil, nil, fmt.Errorf("parse: DNS Question is empty")
-			}
-		}
+	/*gopacket 是基于层级解码（Layer-by-Layer Decoding）机制工作的。要让它成功解析出 layers.LayerTypeDNS，必须满足一系列严格的前置条件。
+	如果任何一个环节断裂，它就会停止解析或者将其识别为普通的 Payload。
+	以下是导致 packet.Layer(layers.LayerTypeDNS) 为 nil 的主要原因：
+	1. 端口号非标准；2 IP 分片；3. TCP 粘包与分段；4. 隧道封装；5. 报文截断；6. 畸形报文
+	*/
+	dnsLayer := packet.Layer(layers.LayerTypeDNS)
+	var rawDnsData []byte
+	if dnsLayer != nil {
+		rawDnsData = dnsLayer.LayerContents()
 	} else {
-		return nil, nil, fmt.Errorf("parse: DNS layer not found")
+		// 如果 gopacket 没有识别出 DNS 层（例如包太短），尝试直接获取 UDP/TCP payload
+		if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
+			rawDnsData = udpLayer.(*layers.UDP).Payload
+		} else if tcpLayer := packet.Layer(layers.LayerTypeTCP); tcpLayer != nil {
+			// TCP 传输 DNS 时带有 2 字节长度前缀，需要去除
+			payload := tcpLayer.(*layers.TCP).Payload
+			if len(payload) > 2 {
+				rawDnsData = payload[2:]
+			}
+		}
 	}
-	return req, rsp, nil
+
+	srcIP, dstIP := networkLayer.NetworkFlow().Endpoints()
+	srcPort, dstPort := transportLayer.TransportFlow().Endpoints()
+
+	if len(rawDnsData) == 0 {
+		return nil, nil, fmt.Errorf("parse: dns layer not found, srcIP: %s, dstIP: %s", srcIP.String(), dstIP.String())
+	}
+
+	// 获取传输层协议
+	isTcp := false
+	if transportLayer.LayerType() == layers.LayerTypeTCP {
+		isTcp = true
+	}
+
+	// 判断是请求还是响应
+	isReq := true
+	// 如果 DNS 内容长度小于 6 字节，直接当做是请求
+	if len(rawDnsData) >= 6 {
+		// 读取 Flags 字段 (Offset 2, 2 bytes)
+		// QR bit is the most significant bit of the first byte of Flags (byte at index 2)
+		// QR: 0 = Query, 1 = Response
+		if (rawDnsData[2] & 0x80) != 0 {
+			isReq = false
+		}
+	}
+
+	if !isReq { // DNS Response
+		rsp := &types.DNSRsp{
+			ClientIP:   dstIP.String(),
+			ClientPort: dstPort.String(),
+			IsTCP:      isTcp,
+			Time:       packet.Metadata().Timestamp,
+			RawData:    rawDnsData,
+		}
+		if rspCnt != nil {
+			(*rspCnt)++
+		}
+		return nil, rsp, nil
+	}
+
+	// DNS Query
+	req := &types.DNSReq{
+		ClientIP:   srcIP.String(),
+		ClientPort: srcPort.String(),
+		IsTCP:      isTcp,
+		Time:       packet.Metadata().Timestamp,
+		RawData:    rawDnsData,
+	}
+	if reqCnt != nil {
+		(*reqCnt)++
+	}
+	return req, nil, nil
 }
 
 // estimateCapacity 根据文件大小估算初始容量

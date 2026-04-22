@@ -1,12 +1,19 @@
-dnsdiff
-dnsreplay
-dnscmp
+# Root binaries
+/dnsdiff
+/dnsreplay
+/dnscmp
+
+# Binaries in bin/
 bin/dnsdiff
 bin/dnsreplay
 bin/dnscmp
+bin/formcheck
 bin/test_dnsdiff
 bin/test_dnsreplay
 bin/test_dnscmp
+
+# Binaries in cmd/
 cmd/dnsdiff/dnsdiff
 cmd/dnsreplay/dnsreplay
 cmd/dnscmp/dnscmp
+cmd/formcheck/formcheck

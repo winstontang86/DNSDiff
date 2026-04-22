@@ -7,12 +7,9 @@ import (
 	"io"
 	"net"
 	"time"
-
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
 )
 
-const (
+var (
 	DNS_PORT = "53"
 )
 
@@ -29,18 +26,14 @@ func SendAndRecv(req *types.DNSReq, targetIP string) (*types.DNSRsp, error) {
 	if err != nil {
 		return nil, err
 	}
-	// 获取 DNS 响应数据
-	dnsData, err := parseDNSResponse(response)
-	if err != nil {
-		return nil, fmt.Errorf("SendAndRecv: failed to parse DNS response: %v", err)
-	}
 
 	return &types.DNSRsp{
 		ClientIP:   req.ClientIP,
 		ClientPort: req.ClientPort,
 		IsTCP:      req.IsTCP,
 		Time:       time.Now(),
-		DnsData:    dnsData,
+		RawData:    response,
+		Req:        req,
 	}, nil
 }
 
@@ -77,6 +70,9 @@ func sendAndRecvTCP(req *types.DNSReq, targetIP string) ([]byte, error) {
 	}
 	defer conn.Close()
 
+	// 设置读取超时时间，防止服务器不响应导致永久阻塞
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+
 	// 发送数据长度前缀
 	dataLen := len(req.RawData)
 	dataLenBytes := []byte{byte(dataLen >> 8), byte(dataLen & 0xff)}
@@ -103,15 +99,4 @@ func sendAndRecvTCP(req *types.DNSReq, targetIP string) ([]byte, error) {
 	}
 
 	return respData, nil
-}
-
-// parseDNSResponse 解析 DNS 响应数据
-func parseDNSResponse(data []byte) (*layers.DNS, error) {
-	packet := gopacket.NewPacket(data, layers.LayerTypeDNS, gopacket.Default)
-	if dnsLayer := packet.Layer(layers.LayerTypeDNS); dnsLayer != nil {
-		if dns, ok := dnsLayer.(*layers.DNS); ok {
-			return dns, nil
-		}
-	}
-	return nil, fmt.Errorf("failed to decode DNS response")
 }

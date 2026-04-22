@@ -2,7 +2,6 @@
 package diff
 
 import (
-	"strconv"
 	"strings"
 
 	"github.com/miekg/dns"
@@ -18,9 +17,11 @@ const (
 	DIFF_BIT_NOMATCHKEY    = 0x00000002
 	DIFF_BIT_NOMATCHDOMAIN = 0x00000004
 	// 头部字段
-	DIFF_BIT_HEAD_RCODE  = 0x00000010
-	DIFF_BIT_HEAD_OPCODE = 0x00000020
-	DIFF_BIT_HEAD_QFLAG  = 0x00000040
+	DIFF_BIT_HEAD_RCODE    = 0x00000010
+	DIFF_BIT_HEAD_OPCODE   = 0x00000020
+	DIFF_BIT_HEAD_QFLAG    = 0x00000040
+	DIFF_BIT_HEAD_AA       = 0x00000080 // AA标志差异，从QFLAG中独立出来以便细粒度过滤
+	DIFF_BIT_HEAD_RCODE_SF = 0x00000100 // 涉及SERVFAIL的Rcode差异，从RCODE中独立出来
 	// question关键字段
 	DIFF_BIT_QUEST_LEN    = 0x00001000
 	DIFF_BIT_QUEST_QNAME  = 0x00002000
@@ -44,6 +45,9 @@ const (
 	DIFF_BIT_ADD_LEN    = 0x01000000
 	DIFF_BIT_ADD_RRDIFF = 0x02000000
 	DIFF_BIT_ADD_CNAME  = 0x04000000
+	// additional段 OPT (EDNS) 选项级别差异
+	DIFF_BIT_ADD_OPT_ECS    = 0x08000000 // ECS (EDNS Client Subnet) 选项差异
+	DIFF_BIT_ADD_OPT_COOKIE = 0x10000000 // DNS Cookie 选项差异
 
 	// 差异等级
 	DIFF_LEVEL_CRITICAL = 0
@@ -58,9 +62,11 @@ var diffLevelMap = map[uint32]int{
 	DIFF_BIT_NOMATCHKEY:    DIFF_LEVEL_IGNORE,
 	DIFF_BIT_NOMATCHDOMAIN: DIFF_LEVEL_IGNORE,
 
-	DIFF_BIT_HEAD_RCODE:  DIFF_LEVEL_CRITICAL,
-	DIFF_BIT_HEAD_OPCODE: DIFF_LEVEL_CRITICAL,
-	DIFF_BIT_HEAD_QFLAG:  DIFF_LEVEL_CRITICAL,
+	DIFF_BIT_HEAD_RCODE:    DIFF_LEVEL_CRITICAL,
+	DIFF_BIT_HEAD_OPCODE:   DIFF_LEVEL_CRITICAL,
+	DIFF_BIT_HEAD_QFLAG:    DIFF_LEVEL_CRITICAL,
+	DIFF_BIT_HEAD_AA:       DIFF_LEVEL_WARNING, // AA标志在转发场景下常见（缓存命中与未命中）
+	DIFF_BIT_HEAD_RCODE_SF: DIFF_LEVEL_WARNING, // SERVFAIL通常由上游超时或冷启动引起
 
 	DIFF_BIT_QUEST_LEN:    DIFF_LEVEL_CRITICAL,
 	DIFF_BIT_QUEST_QNAME:  DIFF_LEVEL_CRITICAL,
@@ -79,6 +85,9 @@ var diffLevelMap = map[uint32]int{
 	DIFF_BIT_ADD_LEN:    DIFF_LEVEL_IGNORE,
 	DIFF_BIT_ADD_RRDIFF: DIFF_LEVEL_NORMAL,
 	DIFF_BIT_ADD_CNAME:  DIFF_LEVEL_NORMAL,
+
+	DIFF_BIT_ADD_OPT_ECS:    DIFF_LEVEL_WARNING,
+	DIFF_BIT_ADD_OPT_COOKIE: DIFF_LEVEL_WARNING,
 }
 
 var diffFlags = [...]struct {
@@ -91,6 +100,8 @@ var diffFlags = [...]struct {
 	{DIFF_BIT_HEAD_RCODE, "RCODE_DIFF"},
 	{DIFF_BIT_HEAD_OPCODE, "OPCODE_DIFF"},
 	{DIFF_BIT_HEAD_QFLAG, "QFLAG_DIFF"},
+	{DIFF_BIT_HEAD_AA, "AA_FLAG_DIFF"},
+	{DIFF_BIT_HEAD_RCODE_SF, "RCODE_SERVFAIL_DIFF"},
 	{DIFF_BIT_QUEST_LEN, "QUEST_LEN_DIFF"},
 	{DIFF_BIT_QUEST_QNAME, "QNAME_DIFF"},
 	{DIFF_BIT_QUEST_QTYPE, "QTYPE_DIFF"},
@@ -105,20 +116,15 @@ var diffFlags = [...]struct {
 	{DIFF_BIT_ADD_LEN, "ADD_LEN_DIFF"},
 	{DIFF_BIT_ADD_RRDIFF, "ADD_RR_DIFF"},
 	{DIFF_BIT_ADD_CNAME, "ADD_CNAME_DIFF"},
+	{DIFF_BIT_ADD_OPT_ECS, "ADD_OPT_ECS_DIFF"},
+	{DIFF_BIT_ADD_OPT_COOKIE, "ADD_OPT_COOKIE_DIFF"},
 }
 
 var (
-	RRSetAllEqual  = 0
-	RRSetPartEqual = 1
-	RRSetAllDiff   = 2
-
 	DefaultMask  = uint32(0x00000000)
 	CriticalMask = uint32(0x00000000)
 	WarningMask  = uint32(0x00000000)
 )
-
-type IPv4Rdata [4]byte
-type IPv6Rdata [16]byte
 
 // WhitelistChecker 白名单检查器接口
 type WhitelistChecker interface {
@@ -127,7 +133,6 @@ type WhitelistChecker interface {
 
 // Comparator 配置项
 type Comparator struct {
-	IgnoreTTL          bool             // 是否忽略TTL差异
 	AllowPartialMatch  bool             // 允许answer的A和AAAA类型rr部分匹配
 	IgnoreAdditional   bool             // 是否忽略additional
 	DiffUnexpectedMask uint32           // 差异不符合预期掩码
@@ -173,6 +178,7 @@ func (c *Comparator) Compare(msg1, msg2 *dns.Msg, diffCode *uint32) error {
 	if *diffCode&CriticalMask != 0 {
 		return err
 	}
+	// 任意一方Truncated时，继续后面段对比
 	// 对比Question
 	err = c.cmpQuestions(msg1.Question, msg2.Question, diffCode)
 	if *diffCode&CriticalMask != 0 {
@@ -205,10 +211,19 @@ func (c *Comparator) compareHeader(msg1, msg2 *dns.Msg, diffCode *uint32) error 
 		bitSet(diffCode, DIFF_BIT_HEAD_OPCODE)
 	}
 	if msg1.Rcode != msg2.Rcode {
-		bitSet(diffCode, DIFF_BIT_HEAD_RCODE)
+		// 涉及SERVFAIL的Rcode差异单独标记，与其他Rcode差异区分
+		if msg1.Rcode == dns.RcodeServerFailure || msg2.Rcode == dns.RcodeServerFailure {
+			bitSet(diffCode, DIFF_BIT_HEAD_RCODE_SF)
+		} else {
+			bitSet(diffCode, DIFF_BIT_HEAD_RCODE)
+		}
 	}
+	// AA标志差异单独标记，与其他标志差异区分
+	if msg1.Authoritative != msg2.Authoritative {
+		bitSet(diffCode, DIFF_BIT_HEAD_AA)
+	}
+	// 其余标志差异（AA已单独处理，TC统一归入QFLAG）
 	if msg1.Response != msg2.Response ||
-		msg1.Authoritative != msg2.Authoritative ||
 		msg1.Truncated != msg2.Truncated ||
 		msg1.RecursionDesired != msg2.RecursionDesired ||
 		msg1.RecursionAvailable != msg2.RecursionAvailable ||
@@ -290,11 +305,16 @@ func (c *Comparator) CmpAnswers(rrs1, rrs2 []dns.RR, diffCode *uint32) error {
 	// 预处理RR列表，分离CNAME和其他记录
 	cname1, other1 := c.preProcRRs(rrs1)
 	cname2, other2 := c.preProcRRs(rrs2)
-	// 对比CNAME链
+	// 对比CNAME链（只比较首尾一致）
 	isSameCname := c.sameCnameChains(cname1, cname2)
 	if !isSameCname {
-		bitSet(diffCode, DIFF_BIT_ANSWER_CNAME)
-		return nil
+		// CNAME链不一致，但如果A/AAAA结果一致，可以忽略CNAME差异
+		if c.sameAResults(other1, other2) {
+			logrus.Debug("Answer section: CNAME chain differs but A/AAAA results are same, ignoring CNAME diff")
+		} else {
+			bitSet(diffCode, DIFF_BIT_ANSWER_CNAME)
+			return nil
+		}
 	}
 	// 对比其他类型的RR记录
 	rrdiff := c.cmpRRSet(other1, other2)
@@ -307,7 +327,7 @@ func (c *Comparator) CmpAnswers(rrs1, rrs2 []dns.RR, diffCode *uint32) error {
 		logrus.WithFields(logrus.Fields{
 			"rrs1_count": len(other1),
 			"rrs2_count": len(other2),
-		}).Debug("Answer section: partial match accepted")
+		}).Debug("Answer section: partial match passed")
 		return nil
 	}
 
@@ -337,250 +357,40 @@ func (c *Comparator) cmpAuthAddRRs(rrs1, rrs2 []dns.RR, diffCode *uint32, isAuth
 	// 处理RR 列表
 	cname1, other1 := c.preProcRRs(rrs1)
 	cname2, other2 := c.preProcRRs(rrs2)
-	// 对比CNAME链
+	// 对比CNAME链（只比较首尾一致）
 	isSameCname := c.sameCnameChains(cname1, cname2)
 	if !isSameCname {
-		if isAuth {
-			bitSet(diffCode, DIFF_BIT_AUTH_CNAME)
+		// CNAME链不一致，但如果A/AAAA结果一致，可以忽略CNAME差异
+		if c.sameAResults(other1, other2) {
+			logrus.Debug("Auth/Add section: CNAME chain differs but A/AAAA results are same, ignoring CNAME diff")
 		} else {
-			bitSet(diffCode, DIFF_BIT_ADD_CNAME)
+			if isAuth {
+				bitSet(diffCode, DIFF_BIT_AUTH_CNAME)
+			} else {
+				bitSet(diffCode, DIFF_BIT_ADD_CNAME)
+			}
+			return nil
 		}
-		return nil
 	}
 	// 对比其他类型
 	rrdiff := c.cmpRRSet(other1, other2)
 	if rrdiff == RRSetAllEqual ||
 		(rrdiff != RRSetAllDiff && c.AllowPartialMatch) {
 		//return DNS_EQUAL
-		return nil
-	}
-	if isAuth {
-		bitSet(diffCode, DIFF_BIT_AUTH_RRDIFF)
 	} else {
-		bitSet(diffCode, DIFF_BIT_ADD_RRDIFF)
+		if isAuth {
+			bitSet(diffCode, DIFF_BIT_AUTH_RRDIFF)
+		} else {
+			bitSet(diffCode, DIFF_BIT_ADD_RRDIFF)
+		}
+	}
+
+	// Additional段不忽略时，比较OPT (EDNS) 中的ECS和Cookie选项
+	if !isAuth {
+		c.cmpOPTRecords(rrs1, rrs2, diffCode)
 	}
 
 	return nil
-}
-
-// preProcRRs 预处理RR列表，
-// 目的是将cname记录和非cname记录分开；目的2是对一些已知类型，把要比较的内容拼在key上，后续直接使用key进行比较
-// 返回:
-//   - cnameMap: map[string]string, CNAME: name -> target
-//   - otherMap: map[string]struct{}, 存储A/AAAA和其他类型记录的key集合
-/*
-记录类型		关键字段
-A				A (IP)
-AAAA			AAAA (IP)
-CNAME			Target (string)		不区分大小写比较
-MX				Preference, Mx		两者都需匹配，Mx不区分大小写
-NS				Ns (string)			不区分大小写比较
-TXT				Txt ([]string)		比较字符串切片，区分大小写
-SOA				Ns, Mbox, Timers	Serial 字段通常需忽略或特殊处理
-SRV				Priority, Weight, Port, Target	所有字段都需匹配，Target不区分大小写
-PTR				Ptr (string)		不区分大小写比较
-*/
-func (c *Comparator) preProcRRs(rrs []dns.RR) (map[string]string, map[string]struct{}) {
-	cnameMap := make(map[string]string, len(rrs))
-	otherMap := make(map[string]struct{}, len(rrs))
-
-	// 预分配 strings.Builder，减少内存分配
-	var keyBuilder strings.Builder
-	keyBuilder.Grow(512) // 预分配合理大小
-	// 用不同类型的核心字段拼成string做key，name type class是必须的（class差异基本不存在，忽略）
-	for _, rr := range rrs {
-		hdr := rr.Header()
-		name := strings.ToLower(hdr.Name) // 统一小写处理
-		rrType := dns.TypeToString[hdr.Rrtype]
-
-		switch rr := rr.(type) {
-		case *dns.CNAME:
-			// CNAME: name -> target
-			cnameMap[name] = strings.ToLower(rr.Target)
-
-		case *dns.A:
-			// A记录: "name|A|ip" -> rr
-			// 使用 strings.Builder 减少字符串拼接开销
-			keyBuilder.Reset()
-			keyBuilder.WriteString(name)
-			keyBuilder.WriteByte('|')
-			keyBuilder.WriteString(rrType)
-			keyBuilder.WriteByte('|')
-			keyBuilder.Write(rr.A)
-			otherMap[keyBuilder.String()] = struct{}{}
-
-		case *dns.AAAA:
-			// AAAA记录: "name|AAAA|ip" -> rr
-			keyBuilder.Reset()
-			keyBuilder.WriteString(name)
-			keyBuilder.WriteByte('|')
-			keyBuilder.WriteString(rrType)
-			keyBuilder.WriteByte('|')
-			keyBuilder.Write(rr.AAAA)
-			otherMap[keyBuilder.String()] = struct{}{}
-
-		case *dns.SOA:
-			// SOA记录: "name|SOA|ns|mbox" -> rr
-			// SOA记录的关键字段是NS和Mbox，序列号等字段可能不同
-			keyBuilder.Reset()
-			keyBuilder.WriteString(name)
-			keyBuilder.WriteByte('|')
-			keyBuilder.WriteString(rrType)
-			keyBuilder.WriteByte('|')
-			keyBuilder.WriteString(strings.ToLower(rr.Ns))
-			keyBuilder.WriteByte('|')
-			keyBuilder.WriteString(strings.ToLower(rr.Mbox))
-			otherMap[keyBuilder.String()] = struct{}{}
-
-		case *dns.MX:
-			// MX记录: "name|MX|preference|mx"
-			keyBuilder.Reset()
-			keyBuilder.WriteString(name)
-			keyBuilder.WriteByte('|')
-			keyBuilder.WriteString(rrType)
-			keyBuilder.WriteByte('|')
-			keyBuilder.WriteString(strings.ToLower(rr.Mx))
-			keyBuilder.WriteByte('|')
-			keyBuilder.WriteString(strconv.Itoa(int(rr.Preference)))
-			otherMap[keyBuilder.String()] = struct{}{}
-
-		case *dns.NS:
-			// NS记录: "name|NS|ns"
-			keyBuilder.Reset()
-			keyBuilder.WriteString(name)
-			keyBuilder.WriteByte('|')
-			keyBuilder.WriteString(rrType)
-			keyBuilder.WriteByte('|')
-			keyBuilder.WriteString(strings.ToLower(rr.Ns))
-			otherMap[keyBuilder.String()] = struct{}{}
-
-		case *dns.TXT:
-			// TXT记录: "name|TXT|txt_content"
-			keyBuilder.Reset()
-			keyBuilder.WriteString(name)
-			keyBuilder.WriteByte('|')
-			keyBuilder.WriteString(rrType)
-			keyBuilder.WriteByte('|')
-			keyBuilder.WriteString(strings.Join(rr.Txt, "|"))
-			otherMap[keyBuilder.String()] = struct{}{}
-
-		case *dns.PTR:
-			// PTR记录: "name|PTR|ptr"
-			keyBuilder.Reset()
-			keyBuilder.WriteString(name)
-			keyBuilder.WriteByte('|')
-			keyBuilder.WriteString(rrType)
-			keyBuilder.WriteByte('|')
-			keyBuilder.WriteString(strings.ToLower(rr.Ptr))
-			otherMap[keyBuilder.String()] = struct{}{}
-
-		default:
-			// 兜底逻辑：使用 dns.Copy 解决 Data Race，这是最稳健的做法
-			if rrCopy := dns.Copy(rr); rrCopy != nil {
-				rrCopy.Header().Ttl = 0 // 安全修改副本
-
-				keyBuilder.Reset()
-				keyBuilder.WriteString(name)
-				keyBuilder.WriteByte('|')
-				keyBuilder.WriteString(rrType)
-				keyBuilder.WriteByte('|')
-				keyBuilder.WriteString(rrCopy.String())
-				otherMap[keyBuilder.String()] = struct{}{}
-			} else {
-				rr.Header().Ttl = 0
-				rrString := rr.String()
-				keyBuilder.Reset()
-				keyBuilder.WriteString(name)
-				keyBuilder.WriteByte('|')
-				keyBuilder.WriteString(rrType)
-				keyBuilder.WriteByte('|')
-				keyBuilder.WriteString(rrString)
-				otherMap[keyBuilder.String()] = struct{}{}
-			}
-		}
-	}
-
-	return cnameMap, otherMap
-}
-
-// sameCnameChains 比较CNAME链
-// 策略：逐个比较
-// CNAME: name -> target
-func (c *Comparator) sameCnameChains(cname1, cname2 map[string]string) bool {
-	// 两者都为空，认为相同
-	if len(cname1) == 0 && len(cname2) == 0 {
-		return true
-	}
-	if len(cname1) != len(cname2) {
-		return false
-	}
-	// 逐条比较每一跳，确保路径完全一致
-	for name, target1 := range cname1 {
-		if target2, ok := cname2[name]; !ok || target1 != target2 {
-			return false
-		}
-	}
-	return true
-}
-
-//cmpRRSet RR集合的通用比较函数
-/*
-	全相同返回0  	RRSetAllEqual
-	部分相同返回1  	RRSetPartEqual
-	全部不同返回2	RRSetAllDiff
-*/
-func (c *Comparator) cmpRRSet(m1, m2 map[string]struct{}) int {
-	len1 := len(m1)
-	len2 := len(m2)
-
-	// 处理空集合
-	if len1 == 0 && len2 == 0 {
-		return RRSetAllEqual
-	}
-	if len1 == 0 || len2 == 0 {
-		return RRSetAllDiff
-	}
-
-	// 快速路径：如果长度不同且不允许部分匹配，直接判定为不同
-	if len1 != len2 && !c.AllowPartialMatch {
-		return RRSetAllDiff
-	}
-
-	// 统计匹配和不匹配的数量
-	matchCnt := 0
-	diffCnt := 0
-
-	// 遍历第一个集合，检查每个RR是否在第二个集合中
-	for k := range m1 {
-		_, exists := m2[k]
-		if !exists {
-			// key不存在，记录为差异
-			diffCnt++
-			// 优化：如果不允许部分匹配且已有差异，提前退出
-			if !c.AllowPartialMatch {
-				return RRSetAllDiff
-			}
-			continue
-		}
-		// key上特殊组装的，只要key一样，内容就是一样的
-		matchCnt++
-		// 加速：如果允许部分匹配，只要有一条匹配就可以提前返回
-		if c.AllowPartialMatch && matchCnt > 0 {
-			return RRSetPartEqual
-		}
-	}
-	// 总差异是：len1+len2-2*matchCnt
-	// 判断匹配程度
-	if matchCnt == len1 && len1 == len2 {
-		// 完全匹配
-		return RRSetAllEqual
-	}
-	if matchCnt == 0 {
-		// 完全不匹配
-		return RRSetAllDiff
-	}
-	// 部分匹配
-	return RRSetPartEqual
 }
 
 // DiffCode2Str 将 diffcode 转换为字符串

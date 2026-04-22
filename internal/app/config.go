@@ -9,7 +9,6 @@ import (
 
 // CompareConfig 对比配置
 type CompareConfig struct {
-	IgnoreTTL          bool   // 是否忽略TTL
 	AllowPartialMatch  bool   // 是否允许部分匹配
 	IgnoreAdditional   bool   // 是否忽略Additional段
 	DiffUnexpectedMask uint32 // 预期差异掩码
@@ -18,7 +17,6 @@ type CompareConfig struct {
 // DefaultCompareConfig 返回默认对比配置
 func DefaultCompareConfig() *CompareConfig {
 	return &CompareConfig{
-		IgnoreTTL:          true,
 		AllowPartialMatch:  true,
 		IgnoreAdditional:   true,
 		DiffUnexpectedMask: diff.DefaultMask,
@@ -37,7 +35,6 @@ func ParseHexMask(maskStr string) (uint32, error) {
 // ToComparator 转换为diff.Comparator
 func (c *CompareConfig) ToComparator() diff.Comparator {
 	return diff.Comparator{
-		IgnoreTTL:          c.IgnoreTTL,
 		AllowPartialMatch:  c.AllowPartialMatch,
 		IgnoreAdditional:   c.IgnoreAdditional,
 		DiffUnexpectedMask: c.DiffUnexpectedMask,

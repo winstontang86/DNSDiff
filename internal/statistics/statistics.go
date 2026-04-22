@@ -117,12 +117,13 @@ func (ds *DiffStat) PrintfDiffStat() {
 		log.Printf("Failed to open file for writing: %v", err)
 		return
 	}
+	defer file.Close()
+
 	csvFile, err := os.OpenFile(statCsv, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		log.Printf("Failed to open file for writing: %v", err)
 		return
 	}
-	defer file.Close()
 	defer csvFile.Close()
 
 	// 打印 Diff 到csv文件
