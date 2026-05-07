@@ -100,6 +100,7 @@ func ValidateRaw(rawData []byte) (errBits, warningBits uint64, msg *dns.Msg, isR
 | 56 | `ErrAssocCDNotCopied` | 请求 CD=1 但响应 CD=0 |
 | 57 | `ErrAssocECSFamilyMismatch` | ECS Family 不匹配 |
 | 58 | `ErrAssocECSSourcePrefixMismatch` | ECS Source Prefix 不匹配 |
+| 59 | `ErrAssocCNAMEWithOther` | CNAME 与其他非 DNSSEC 类型共存 |
 
 ### 警告码 (Warning Bits)
 
@@ -149,7 +150,7 @@ package main
 import (
 	"fmt"
 	"github.com/miekg/dns"
-	"dns/dnsdiff/internal/validate"
+	"dnsdiff/internal/validate"
 )
 
 func main() {

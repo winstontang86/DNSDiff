@@ -1,335 +1,250 @@
 # 快速开始指南
 
-## 项目重构说明
-
-本项目已按照标准Go项目布局进行重构。如果您是第一次使用重构后的代码，请阅读本指南。
+本指南面向第一次使用本项目的读者，内容与当前代码同步。详细背景、差异码、白名单等请参考 [README.md](README.md)。
 
 ## 目录结构概览
 
 ```
 dnsdiff/
 ├── cmd/                    # 可执行程序入口
-│   ├── dnsdiff/           # DNS对比工具（支持网络重试）
-│   ├── dnscmp/            # DNS对比工具（仅对比pcap）
-│   └── dnsreplay/         # DNS重放工具
-├── internal/              # 内部库
-│   ├── app/              # 应用配置和日志
-│   ├── diff/             # 对比逻辑
+│   ├── dnsdiff/           # DNS 重放 + 对比（支持重试）
+│   ├── dnscmp/            # 双 pcap 对比
+│   ├── dnsreplay/         # DNS 请求重放
+│   └── formcheck/         # DNS 报文格式校验
+├── internal/              # 内部包
+│   ├── app/              # 配置 / 日志 / 白名单
+│   ├── diff/             # 对比逻辑与差异码
 │   ├── dnet/             # 网络请求
-│   ├── parser/           # pcap解析
-│   ├── saver/            # 结果保存
-│   └── statistics/       # 统计信息
-├── pkg/                  # 公共库
+│   ├── parser/           # pcap 解析
+│   ├── saver/            # 差异结果保存
+│   ├── statistics/       # 统计汇总 / CSV 输出
+│   └── validate/         # RFC 校验
+├── pkg/                  # 可对外引用的包
 │   ├── types/           # 数据类型
 │   └── utils/           # 工具函数
-├── comm/                 # 兼容层（向后兼容）
-├── bin/                  # 编译输出
-└── log/                  # 日志目录
+├── bin/                  # 编译产物
+└── log/                  # 运行日志
 ```
 
 ## 编译项目
 
-### 方式1：使用构建脚本（推荐）
+### 方式 1：使用构建脚本（推荐）
 
 ```bash
 ./build.sh
 ```
 
-这将在项目根目录生成三个可执行文件：
-- `dnsdiff` - DNS对比工具（支持网络重试）
-- `dnscmp` - DNS对比工具（仅对比pcap）
-- `dnsreplay` - DNS重放工具
+会在 `bin/` 目录下生成四个可执行文件：
+- `bin/dnsdiff`
+- `bin/dnscmp`
+- `bin/dnsreplay`
+- `bin/formcheck`
 
-### 方式2：手动编译
+### 方式 2：手动编译
 
 ```bash
-# 编译到bin目录（推荐）
 mkdir -p bin
-go build -o bin/dnsdiff ./cmd/dnsdiff
-go build -o bin/dnscmp ./cmd/dnscmp
+go build -o bin/dnsdiff   ./cmd/dnsdiff
+go build -o bin/dnscmp    ./cmd/dnscmp
 go build -o bin/dnsreplay ./cmd/dnsreplay
-
-# 或编译到项目根目录
-go build -o dnsdiff ./cmd/dnsdiff
-go build -o dnscmp ./cmd/dnscmp
-go build -o dnsreplay ./cmd/dnsreplay
+go build -o bin/formcheck ./cmd/formcheck
 ```
 
-### 方式3：直接运行
+### 方式 3：直接 `go run`
 
 ```bash
-go run ./cmd/dnsdiff -h
-go run ./cmd/dnscmp -h
+go run ./cmd/dnsdiff   -h
+go run ./cmd/dnscmp    -h
 go run ./cmd/dnsreplay -h
+go run ./cmd/formcheck -h
 ```
+
+> Linux 需预装 libpcap：`sudo yum install -y libpcap-devel`。
 
 ## 使用示例
 
-### 1. dnsdiff - 完整对比工具
+### 1. dnsdiff — 完整对比工具
 
-支持从pcap文件解析、网络重试、结果保存。具有智能重试机制：
-- 首次对比：根据qonly参数决定originMsg获取方式（map或网络请求）
-- 重试对比：如果首次有差异，对origin和test各发起两次请求进行对比
-- Answer段合并对比：当三次都是DIFF_BIT_ANSWER_RRDIFF时，合并Answer段进行最终对比
-
-```bash
-# 基本用法
-./dnsdiff -f test.pcap -tip 10.0.0.1 -oip 10.0.0.2
-
-# 完整参数
-./dnsdiff \
-  -f test.pcap \              # pcap文件路径（必需）
-  -tip 10.0.0.1 \           # 测试服务器IP（必需）
-  -oip 10.0.0.2 \           # 线上服务器IP（qo=1时必需）
-  -c 100 \                    # 消费者数量（默认1000）
-  -qps 1000 \                 # QPS限制（默认1，最小10）
-  -l info \                   # 日志级别（debug/info/warn/error）
-  -m 0xFF00 \                 # 预期差异掩码
-  -rt 1 \                     # 差异重试开关（1=是，0=否）
-  -qo 0 \                     # 仅查询模式（pcap只包含请求）（1=是，0=否）
-  -ia 1 \                     # 忽略Additional段（1=是，0=否）
-  -ap 1 \                     # 允许部分匹配（1=是，0=否）
-  -w config.yaml              # 白名单配置文件（可选）
-```
-
-### 2. dnscmp - 轻量级对比工具
-
-仅对比两个pcap文件，不进行网络请求。
+`dnsdiff` 采用 **长短参数** 两种形式（等价）。核心能力：
+- 首次对比：默认从 pcap 解析出的 `rspMap` 中获取 origin 响应；`-query-only` 模式下改为向 `-o/-origin-ip` 发起网络请求。
+- 重试对比：`-retry` 开启（默认）且指定了 `-o/-origin-ip` 时，对 origin 与 test 各再发起 2 次请求。
+- 交叉对比：重试仍不一致时，将第 1 次 origin × 第 2 次 test、第 2 次 origin × 第 1 次 test 交叉比对。
+- Answer 合并：三次均为 `ANSWER_RR_DIFF` 时，合并全部 Answer 段做最终 RR 集合比较。
 
 ```bash
-# 基本用法
-./dnscmp -t test.pcap -o online.pcap
+# 基本用法（origin 从 pcap 获取）
+./bin/dnsdiff -i traffic.pcap -t 10.0.0.1 -q 5000
 
-# 完整参数
-./dnscmp \
-  -t test.pcap \              # 测试pcap文件（必需）
-  -o online.pcap \            # 线上pcap文件（必需）
-  -l info \                   # 日志级别（info/debug/warn/error）
-  -m 0xFF00 \                 # 预期差异掩码
-  -a 1 \                      # 忽略Additional段（1=是，0=否）
-  -p 1                        # 允许部分匹配（1=是，0=否）
+# 带线上服务器的重试对比
+./bin/dnsdiff -i traffic.pcap -t 10.0.0.1 -o 10.0.0.2 -q 8000 -retry
+
+# query-only：pcap 中只有请求
+./bin/dnsdiff -i requests.pcap -t 10.0.0.1 -o 10.0.0.2 -q 3000 -query-only
+
+# 完整参数示例
+./bin/dnsdiff \
+  -i traffic.pcap \       # 或 -input
+  -t 10.0.0.1 \            # 或 -test-ip
+  -o 10.0.0.2 \            # 或 -origin-ip
+  -q 5000 \                # 或 -qps，最小 2
+  -m 0x35F0B7 \            # 或 -mask，默认 DefaultMask
+  -allow-partial \          # 允许 Answer 部分匹配（默认 true）
+  -ignore-additional \      # 忽略 Additional 段（默认 true）
+  -retry \                  # 开启重试（默认 true）
+  -query-only=false \       # 是否仅请求模式
+  -w whitelist.yaml \       # 白名单 YAML
+  -c 1000 \                # 或 -concurrency，消费者协程数
+  -l info                    # 或 -level
 ```
 
-### 3. dnsreplay - DNS重放工具
+### 2. dnscmp — 双 pcap 对比
 
-从pcap文件读取DNS请求并重放到指定服务器。
+只对比两份 pcap，不产生任何网络请求；其他行为和 `dnsdiff` 一致（同样生成差异文件与统计）。
 
 ```bash
-# 基本用法
-./dnsreplay -f test.pcap -d 10.0.0.1
-
-# 完整参数
-./dnsreplay \
-  -f test.pcap \              # pcap文件路径（必需）
-  -d 10.0.0.1 \           # 目标服务器IP（必需）
-  -c 100 \                    # 消费者数量（默认1000）
-  -r 1000                     # QPS限制（默认1）
+./bin/dnscmp \
+  -t test.pcap \          # 被测 pcap（必填）
+  -o online.pcap \         # 线上 pcap（必填）
+  -a 1 \                    # 忽略 Additional，1=是 / 0=否
+  -p 1 \                    # 允许 Answer 部分匹配
+  -m 0x35F0B7 \             # 非预期差异掩码
+  -l info                    # 日志级别
 ```
 
-## 查看结果
+### 3. dnsreplay — DNS 重放
 
-### 日志文件
-
-所有工具的日志都输出到：
-```
-log/udns_dial.log
-```
-
-日志格式为JSON，便于解析和分析。
-
-### 差异文件
-
-dnsdiff和dnscmp会生成两个差异文件：
-```
-diff_old.txt    # 线上服务器的响应
-diff_new.txt    # 测试服务器的响应
+```bash
+./bin/dnsreplay \
+  -f test.pcap \          # pcap 路径（必填）
+  -d 10.0.0.1 \            # 目标 IP（必填）
+  -r 1000 \                 # QPS（最小 10，默认 1）
+  -c 1000 \                 # 消费者协程数
+  -p tcp                     # 强制协议：udp / tcp / 空（跟随 pcap）
 ```
 
-可以使用Beyond Compare等工具对比这两个文件。
+### 4. formcheck — 报文格式校验
 
-### 统计信息
+对 pcap 中的 DNS 报文进行结构 / RFC / 关联校验，输出 `checksummary_MMDD_HHMMSS.csv`。
 
-程序结束时会在控制台输出统计信息：
-- 总请求数
-- 差异数量
-- 各类型差异的详细统计
-- 按域名zone分组的统计
+```bash
+./bin/formcheck \
+  -f traffic.pcap \       # pcap 路径（必填）
+  -d 10.0.0.1 \            # 目标 IP 过滤；指定后会做主动探测
+  -c all \                  # 模式：req | rsp | all
+  -proto default \           # 强制协议：udp | tcp | default
+  -n 1000 \                  # worker 协程数
+  -qps 0 \                   # 主动探测 QPS（0 不限）
+  -warn                      # 打印带 warning 的报文（error 总打印）
+```
+
+## 输出与查看
+
+### 日志
+所有工具日志（默认）写入：
+```
+log/udns_dial.log        # dnsdiff/dnscmp/dnsreplay
+log/formcheck.log        # formcheck
+```
+日志为 JSON 格式，可使用 `jq` 查看：
+```bash
+tail -f log/udns_dial.log | jq .
+```
+
+### 差异文件（dnsdiff / dnscmp）
+文件名带时间戳，便于区分多次运行：
+```
+diffold-MMDDhhmmss.txt    # origin 侧响应
+diffnew-MMDDhhmmss.txt    # test 侧响应
+diffstat-MMDDhhmm.txt     # 汇总统计
+diffstat-MMDDhhmm.csv     # 详情（DNS Type, Zone, Diff Code, Diff desc, Count）
+```
+
+### 控制台统计
+`dnsdiff`、`dnscmp` 结束时会在控制台打印 Total summary，包括按 qtype × diffCode 分桶的计数。
+
+## 抓包建议
+建议仅抓对象机器 53 端口相关流量，避免无效数据：
+```bash
+tcpdump -iany -nn \
+  "(dst host 9.208.51.5 and dst port 53) or (src host 9.208.51.5 and src port 53)" \
+  -w traffic.pcap
+```
+
+## 常见问题
+
+### Q1. 差异文件没有产生？
+说明没有任何差异落到"非预期掩码"（`-m/-mask`）里。可以：
+- 用 `-l debug` 查看日志中被过滤或被忽略的 diffCode。
+- 放宽掩码（例如把 `DIFF_BIT_ANSWER_RRDIFF` 加进来）看看是否符合预期。
+- 检查白名单是否过宽（`log/udns_dial.log` 中有 `Whitelist applied` 的记录）。
+
+### Q2. origin 响应从哪里来？
+- 默认（`-query-only=false`）从 pcap 解析出的 `rspMap` 中查找；找不到且指定了 `-o/-origin-ip`，会走网络补发。
+- `-query-only=true`：必须指定 `-o/-origin-ip`，全部走网络请求。
+
+### Q3. 重试机制作用？
+`-retry` 开启且指定了 `-o/-origin-ip`，可消化：
+1. origin 首次转发命中权威、重试命中缓存导致的 AA 差异；
+2. 域名 RR 在小集合内轮转导致的 `ANSWER_RR_DIFF`；
+3. 偶发的 SERVFAIL / 上游超时。
+
+### Q4. dnscmp 支持白名单吗？
+当前版本的 `dnscmp` 不读取白名单配置。需要白名单时请使用 `dnsdiff`。
+
+### Q5. 编译提示找不到包？
+在仓库根目录执行：
+```bash
+go mod tidy
+./build.sh
+```
+确保根目录存在 `go.mod`，且在仓库根目录下执行编译命令。
+
+### Q6. 如何清理产物？
+```bash
+rm -rf bin/
+rm -f diffold-*.txt diffnew-*.txt diffstat-*.txt diffstat-*.csv checksummary_*.csv
+rm -rf log/*.log
+```
 
 ## 开发指南
 
-### 添加新功能
-
-1. **添加新的内部包**
-   ```bash
-   mkdir internal/newfeature
-   # 创建 internal/newfeature/newfeature.go
-   ```
-
-2. **添加新的公共类型**
-   ```bash
-   # 编辑 pkg/types/types.go
-   ```
-
-3. **添加新的工具函数**
-   ```bash
-   # 编辑 pkg/utils/utils.go
-   ```
-
-### Import路径
-
-新代码应使用以下import路径：
-
+### Import 路径规范
 ```go
 import (
-    // 应用层
     "dnsdiff/internal/app"
-    
-    // 业务逻辑层
     "dnsdiff/internal/diff"
     "dnsdiff/internal/dnet"
     "dnsdiff/internal/parser"
     "dnsdiff/internal/saver"
     "dnsdiff/internal/statistics"
-    
-    // 基础库层
+    "dnsdiff/internal/validate"
     "dnsdiff/pkg/types"
     "dnsdiff/pkg/utils"
 )
 ```
-
-**注意**：不要使用`dnsdiff/comm`，这是为向后兼容保留的兼容层。
+不要引入 `dnsdiff/comm`（已不复存在，仓库内不再提供兼容层）。
 
 ### 运行测试
-
 ```bash
-# 运行所有测试
 go test ./...
-
-# 运行特定包的测试
-go test ./internal/parser
-go test ./pkg/utils
-
-# 运行测试并显示覆盖率
-go test -cover ./...
-
-# 生成覆盖率报告
-go test -coverprofile=coverage.out ./...
-go tool cover -html=coverage.out
+go test -cover ./internal/diff ./internal/validate
+go test -coverprofile=coverage.out ./... && go tool cover -html=coverage.out
 ```
 
 ### 代码检查
-
 ```bash
-# 格式化代码
 go fmt ./...
-
-# 静态检查
 go vet ./...
-
-# 使用golangci-lint（如果已安装）
-golangci-lint run
-```
-
-## 常见问题
-
-### Q1: 编译时提示找不到包
-
-**A**: 确保您在项目根目录（dnsdiff/）下执行编译命令，并且go.mod文件存在。
-
-```bash
-cd /path/to/dnsdiff
-go mod tidy
-go build ./cmd/dnsdiff
-```
-
-### Q2: 旧代码如何迁移？
-
-**A**: 旧代码可以继续使用comm包，无需立即修改。如需迁移：
-
-```go
-// 旧代码
-import "dnsdiff/comm"
-req := comm.DNSReq{}
-key := comm.GenU64Key(...)
-
-// 新代码
-import (
-    "dnsdiff/pkg/types"
-    "dnsdiff/pkg/utils"
-)
-req := types.DNSReq{}
-key := utils.GenU64Key(...)
-```
-
-### Q3: 如何查看详细日志？
-
-**A**: 使用`-l debug`参数启用调试日志：
-
-```bash
-./dnsdiff -p test.pcap -t 10.0.0.1 -r 10.0.0.2 -l debug
-```
-
-然后查看日志文件：
-```bash
-tail -f log/udns_dial.log | jq .
-```
-
-### Q4: 编译后的文件在哪里？
-
-**A**: 
-- 使用`build.sh`：在项目根目录
-- 使用`go build -o bin/xxx`：在bin/目录
-- 使用`go build`：在当前目录
-
-### Q5: qonly参数的作用是什么？
-
-**A**: qonly（query only）参数用于指定pcap文件是否只包含DNS请求：
-- `qo=0`（默认）：pcap包含请求和响应，首次对比时originMsg从map中获取
-- `qo=1`：pcap只包含请求，首次对比时originMsg通过网络请求获取
-
-这影响重试逻辑中第一次对比的originMsg获取方式。
-
-### Q6: 如何清理编译产物？
-
-**A**:
-```bash
-# 清理bin目录
-rm -rf bin/
-
-# 清理根目录的可执行文件
-rm -f dnsdiff dnscmp dnsreplay
-
-# 清理日志
-rm -rf log/*.log
-
-# 清理差异文件
-rm -f diff_*.txt
+golangci-lint run   # 如已安装
 ```
 
 ## 相关文档
-
-- [STRUCTURE.md](STRUCTURE.md) - 详细的目录结构说明
-- [REFACTOR_SUMMARY.md](REFACTOR_SUMMARY.md) - 重构总结
-- [README.md](README.md) - 项目说明
-
-## 获取帮助
-
-如有问题，请：
-1. 查看相关文档
-2. 使用`-h`参数查看命令帮助
-3. 查看日志文件排查问题
-4. 联系项目维护者
-
-## 贡献代码
-
-欢迎贡献代码！请遵循以下规范：
-
-1. **代码风格**: 遵循Go官方代码规范
-2. **包组织**: 新功能放在internal/或pkg/下
-3. **测试**: 为新功能添加单元测试
-4. **文档**: 更新相关文档
-5. **提交**: 使用清晰的commit message
+- [README.md](README.md) — 项目说明（含差异码/白名单详解）
+- [REFACTOR.md](REFACTOR.md) — 目录重构历史
+- [pkg/DNS_msg.md](pkg/DNS_msg.md) — DNS / EDNS(0) / ECS 报文结构
+- [internal/validate/validate.md](internal/validate/validate.md) — formcheck/validate 包文档
+- [internal/validate/DNS的rfc规则.md](internal/validate/DNS的rfc规则.md) — RFC 规则摘要
 
 ---
 
-**祝您使用愉快！** 🎉
+祝您使用愉快！🎉
